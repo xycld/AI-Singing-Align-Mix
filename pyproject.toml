@@ -1,0 +1,19 @@
+[project]
+name = "ai-singing-app"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "librosa",
+    "soundfile",
+    "torch",
+    "scipy",
+    "fastdtw",
+    "transformers",
+    "deepfilternet",
+    "pedalboard",
+    "demucs",
+    "matplotlib"
+]
