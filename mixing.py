@@ -40,7 +40,7 @@ class AIMixer:
     def _to_mono(self, audio):
         """转换为单声道波形"""
         audio = self._ensure_2d(audio)
-        # channel-first -> 平均左右声道
+        # 平均左右声道以保持中心定位，避免单声道信号落在一侧
         return np.mean(audio, axis=0)
 
     def _smooth_curve(self, curve, window=5):
@@ -115,7 +115,7 @@ class AIMixer:
 
         ref_db = 20 * np.log10(ref_rms + 1e-6)
         user_db = 20 * np.log10(user_rms + 1e-6)
-        # 只做相对动态跟随，并限幅避免泵音
+        # 只跟随动态起伏，不追求绝对响度，限幅压住可能的泵音
         gain_db = np.clip((ref_db - user_db) * strength, -9.0, 9.0)
 
         frame_positions = np.arange(min_frames) * hop_length
@@ -125,7 +125,7 @@ class AIMixer:
         if gain_linear.size == 1:
             gain_curve = np.repeat(gain_linear[0], user_audio.shape[1])
         else:
-            # 插值到采样点，保证相位连续，避免突兀
+            # 插值到采样点，保证增益连续，避免听感突兀
             gain_curve = np.interp(
                 sample_positions,
                 frame_positions,
@@ -136,7 +136,7 @@ class AIMixer:
 
         adjusted = user_audio * gain_curve
 
-        # 提示音高/颤音差异（不直接修音，只做参考）
+        # 仅提示音高/颤音差异，为后续人工修音提供依据
         ref_pitch = ref_feat["pitch"][:min_frames]
         user_pitch = user_feat["pitch"][:min_frames]
         valid = (ref_pitch > 0) & (user_pitch > 0)
@@ -188,7 +188,7 @@ class AIMixer:
 
     def get_spectral_centroid(self, audio):
         """计算频谱质心 (判断声音是亮还是闷)"""
-        # 使用 3000Hz 作为基准频率进行归一化分析
+        # 以 3000Hz 为归一化参考，弱化高频噪声对质心的拉升
         cent = librosa.feature.spectral_centroid(y=audio, sr=self.sr)[0]
         return np.mean(cent)
 
@@ -198,9 +198,9 @@ class AIMixer:
         """
         print("   [AI分析] 正在“听”原唱的混音参数...")
         
-        # 加载原唱干声
+        # 先量测原唱人声响度，为后续配平建立基线
         y_ref, _ = librosa.load(ref_vocal_path, sr=self.sr, mono=True)
-        # 加载伴奏
+        # 再量测伴奏响度，以计算目标差值
         y_inst, _ = librosa.load(inst_path, sr=self.sr, mono=True)
         
         # 1. 分析响度平衡 (Balance)
@@ -233,32 +233,30 @@ class AIMixer:
         
         print(f"      -> 自动 EQ 决策: HighShelf {high_shelf_gain:+.1f}dB")
 
-        # 2. 动态阈值
+        # 2. 动态阈值（门限随用户响度自适应）
         comp_threshold = max(-40.0, vocal_rms_db - 8.0) 
         gate_threshold = max(-60.0, vocal_rms_db - 35.0)
 
         board = Pedalboard([
-            # 基础清理
+            # 基础清理：先降噪+高通，避免低频占用压缩机余量
             NoiseGate(threshold_db=gate_threshold, ratio=4, release_ms=200),
             HighpassFilter(cutoff_frequency_hz=80),
 
-            # 智能 EQ (Tone Matching)
-            # 核心：根据原唱的亮度来调整你的音色，而不是瞎调
+            # 智能 EQ：基于亮度差来决定高棚增益，避免盲目调高频
             HighShelfFilter(cutoff_frequency_hz=8000, gain_db=high_shelf_gain),
             
-            # 修正鼻音/浑浊感 (通用优化)
+            # 修正鼻音/浑浊感：在 400Hz 处轻微下凹
             PeakFilter(cutoff_frequency_hz=400, gain_db=-2.5, q=1.0),
 
-            # 压缩 (控制动态，但不压死)
+            # 压缩：软比率与慢攻避免咬字被抹平
             Compressor(
                 threshold_db=comp_threshold,
-                ratio=2.5,       # 稍微温柔一点，保留你的声音特征
-                attack_ms=10.0,  # 慢一点启动，保留更多咬字头
+                ratio=2.5,       # 温柔比率，保留声线特征
+                attack_ms=10.0,  # 慢攻释放咬字起音
                 release_ms=100.0,
             ),
 
-            # 混响 (润色)
-            # 默认给一点点通用的 Plate 混响，避免太干
+            # 混响：少量 Plate 提供空间感，避免过干
             Reverb(room_size=0.5, wet_level=0.2, dry_level=0.8, width=0.6),
         ])
         
@@ -268,18 +266,18 @@ class AIMixer:
         if not os.path.exists(user_path) or not os.path.exists(inst_path) or not os.path.exists(ref_path):
             raise FileNotFoundError("输入文件不存在")
 
-        # 1. 分析原唱 (学习目标)
+        # 先学习原唱的响度/亮度作为目标轨迹
         target_balance_db, target_brightness = self.analyze_reference(ref_path, inst_path)
 
         print("2. 加载与处理用户人声...")
-        # 重新加载用于处理 (Pedalboard 格式)
+        # 用 AudioFile 读取保持浮点精度和声道形状，便于直接送入 Pedalboard
         with AudioFile(user_path) as f:
             user_audio = f.read(f.frames)
             user_sr = f.samplerate
 
         user_audio = self._ensure_stereo(user_audio)
 
-        # 2.0 情感对齐：根据原唱的力度/颤音包络微调
+        # 2.0 情感对齐：先把动态/情绪包络对齐，再进入 EQ/压缩
         if enable_emotion:
             with AudioFile(ref_path) as f:
                 ref_audio = f.read(f.frames)
@@ -312,22 +310,22 @@ class AIMixer:
         user_mono = self._to_mono(user_audio)
         user_db = self.get_loudness(user_mono)
 
-        # 2.2 构建并应用效果链
+        # 2.2 基于目标亮度/响度构建效果链
         board = self.build_smart_chain(user_mono, target_brightness, user_db)
         processed_user = board(user_audio, user_sr)
 
         # 2.3 自动电平匹配 (Auto-Leveling)
-        # 处理后的用户响度
+        # 处理后的用户响度（用于计算需要补偿的增益）
         processed_db = self.get_loudness(self._to_mono(processed_user))
 
-        # 我们需要伴奏的响度来做基准
+        # 以伴奏响度为基准，保持原曲平衡
         with AudioFile(inst_path) as f:
             inst_audio = f.read(f.frames)
             inst_sr = f.samplerate
 
         inst_audio = self._ensure_2d(inst_audio)
 
-        # [修复] 检查并统一采样率 (防止伴奏变慢/变快)
+        # 采样率不一致会导致时长偏移，先统一到 user_sr
         if inst_sr != user_sr:
             if self._has_ffmpeg():
                 print(f"   [采样率] ffmpeg 重采样伴奏 {inst_sr}->{user_sr}")
@@ -347,10 +345,10 @@ class AIMixer:
         inst_mono = self._to_mono(inst_audio)
         current_inst_db = self.get_loudness(inst_mono)
 
-        # 目标用户响度 = 伴奏响度 + 原唱与伴奏的差值
+        # 目标用户响度 = 伴奏响度 + 原唱与伴奏的差值（保持原曲人声/伴奏比）
         target_user_db = current_inst_db + target_balance_db
 
-        # 计算需要补偿的增益
+        # 计算需要补偿的增益（线性系数用于最终音频）
         gain_needed_db = target_user_db - processed_db
         gain_linear = 10 ** (gain_needed_db / 20)
         
@@ -360,7 +358,7 @@ class AIMixer:
         final_user = processed_user * gain_linear
 
         print("3. 最终混合...")
-        # 对齐长度
+        # 对齐长度，避免尾部不等长导致爆音或静音
         inst_audio = self._ensure_stereo(inst_audio)
         min_len = min(final_user.shape[1], inst_audio.shape[1])
 
@@ -377,7 +375,7 @@ class AIMixer:
             f.write(vocal_only)
         print(f"   已输出人声处理版 -> {vocal_only_path}")
 
-        # 混合 (伴奏不降音量，人声去适配伴奏)
+        # 混合时不削伴奏，保持原曲能量，人声去适配
         mix_audio = final_user + inst_audio
 
         final_mix = master_board(mix_audio, user_sr)
@@ -394,7 +392,7 @@ class AIMixer:
                 ref_sr = f.samplerate
 
             ref_audio = self._ensure_2d(ref_audio)
-            # 重采样与声道处理
+            # 重采样与声道处理，确保与最终混音同规格
             if ref_sr != user_sr:
                 if self._has_ffmpeg():
                     print(f"   [采样率] ffmpeg 重采样原唱(对照) {ref_sr}->{user_sr}")
@@ -411,17 +409,17 @@ class AIMixer:
                     ref_sr = user_sr
             ref_audio = self._ensure_stereo(ref_audio)
 
-            # 裁剪
+            # 裁剪到与伴奏/人声一致，防止对齐偏差
             ref_audio = ref_audio[:, :min_len]
 
-            # 3.2 输出：用户 + 原唱 对照版（无伴奏）
+            # 3.2 输出：用户 + 原唱，对比音色/情感，不引入伴奏干扰
             user_plus_ref = master_board(final_user + ref_audio, user_sr)
             user_plus_ref_path = os.path.splitext(output_path)[0] + "_with_ref.wav"
             with AudioFile(user_plus_ref_path, 'w', user_sr, user_plus_ref.shape[0]) as f:
                 f.write(user_plus_ref)
             print(f"已生成对照版 (你 + 原唱) -> {user_plus_ref_path}")
 
-            # 3.3 输出：用户 + 伴奏 + 原唱(低音量 -6dB)
+            # 3.3 输出：用户 + 伴奏 + 原唱(-6dB)，用于 AB 检查是否跟上原唱
             guide_mix = final_user + inst_audio + (ref_audio * 0.5)
 
             final_guide = master_board(guide_mix, user_sr)
