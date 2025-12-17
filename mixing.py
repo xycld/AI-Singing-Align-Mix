@@ -69,6 +69,7 @@ class AIMixer:
             sr=sr,
             hop_length=hop_length
         )[0]
+        # 选择人声常见音高范围，让 YIN 收敛更快且减少错误检测
         pitch = librosa.yin(
             mono,
             fmin=80,
@@ -114,6 +115,7 @@ class AIMixer:
 
         ref_db = 20 * np.log10(ref_rms + 1e-6)
         user_db = 20 * np.log10(user_rms + 1e-6)
+        # 只做相对动态跟随，并限幅避免泵音
         gain_db = np.clip((ref_db - user_db) * strength, -9.0, 9.0)
 
         frame_positions = np.arange(min_frames) * hop_length
@@ -123,6 +125,7 @@ class AIMixer:
         if gain_linear.size == 1:
             gain_curve = np.repeat(gain_linear[0], user_audio.shape[1])
         else:
+            # 插值到采样点，保证相位连续，避免突兀
             gain_curve = np.interp(
                 sample_positions,
                 frame_positions,
@@ -286,6 +289,7 @@ class AIMixer:
             if ref_sr != user_sr:
                 if self._has_ffmpeg():
                     print(f"   [采样率] ffmpeg 重采样原唱 {ref_sr}->{user_sr}")
+                    # 直接重读文件而不对数组重采样，避免大文件占内存
                     ref_audio, ref_sr = self._resample_with_ffmpeg(ref_path, user_sr)
                 else:
                     ref_audio = librosa.resample(
