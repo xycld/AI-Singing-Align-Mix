@@ -1,10 +1,27 @@
 # Python-generated files
 __pycache__/
 *.py[oc]
+*.so
 build/
 dist/
 wheels/
 *.egg-info
 
 # Virtual environments
-.venv
+.venv/
+.env
+.env.*
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Audio outputs & temp
+output_*.wav
+check_*.wav
+tmp*.wav
+*.tmp.wav
+separated/
+
+# OS noise
+.DS_Store
+Thumbs.db
